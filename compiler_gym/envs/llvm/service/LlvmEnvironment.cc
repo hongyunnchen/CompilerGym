@@ -9,6 +9,7 @@
 #include <glog/logging.h>
 
 #include <optional>
+#include <subprocess/subprocess.hpp>
 
 #include "boost/filesystem.hpp"
 #include "compiler_gym/envs/llvm/service/ActionSpace.h"
@@ -18,6 +19,7 @@
 #include "compiler_gym/third_party/autophase/InstCount.h"
 #include "compiler_gym/util/EnumUtil.h"
 #include "compiler_gym/util/GrpcStatusMacros.h"
+#include "compiler_gym/util/RunfilesPath.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/IR/DebugInfo.h"
@@ -102,6 +104,17 @@ void initLlvm() {
   llvm::initializeWriteBitcodePassPass(Registry);
 }
 
+Status writeBitcodeToFile(const llvm::Module& module, const fs::path& path) {
+  std::error_code error;
+  llvm::raw_fd_ostream outfile(path.string(), error);
+  if (error.value()) {
+    return Status(StatusCode::INTERNAL,
+                  fmt::format("Failed to write bitcode file: {}", path.string()));
+  }
+  llvm::WriteBitcodeToFile(module, outfile);
+  return Status::OK;
+}
+
 }  // anonymous namespace
 
 LlvmEnvironment::LlvmEnvironment(std::unique_ptr<Benchmark> benchmark, LlvmActionSpace actionSpace,
@@ -150,10 +163,7 @@ Status LlvmEnvironment::takeAction(const ActionRequest& request, ActionReply* re
       for (int i = 0; i < request.action_size(); ++i) {
         LlvmAction action;
         RETURN_IF_ERROR(util::intToEnum(request.action(i), &action));
-// Use the generated HANDLE_PASS() switch statement to dispatch to runPass().
-#define HANDLE_PASS(pass) runPass(pass, reply);
-        HANDLE_ACTION(action, HANDLE_PASS)
-#undef HANDLE_PASS
+        RETURN_IF_ERROR(runAction(action, reply));
       }
   }
 
@@ -173,6 +183,21 @@ Status LlvmEnvironment::takeAction(const ActionRequest& request, ActionReply* re
   }
 
   return Status::OK;
+}
+
+Status LlvmEnvironment::runAction(LlvmAction action, ActionReply* reply) {
+  // The -gvn-sink pass has nondeterministic behavior, likely due to pointer
+  // address sorting. To maintain a deterministic action space we have a special
+  // handler for this action which regresses to invoking the command line.
+  // See: https://github.com/facebookresearch/CompilerGym/issues/46
+  if (action == LlvmAction::GVNSINK_PASS) {
+    return runGvnSink(reply);
+  }
+
+// Use the generated HANDLE_PASS() switch statement to dispatch to runPass().
+#define HANDLE_PASS(pass) runPass(pass, reply);
+  HANDLE_ACTION(action, HANDLE_PASS)
+#undef HANDLE_PASS
 }
 
 void LlvmEnvironment::runPass(llvm::Pass* pass, ActionReply* reply) {
@@ -195,6 +220,60 @@ void LlvmEnvironment::runPass(llvm::FunctionPass* pass, ActionReply* reply) {
   reply->set_action_had_no_effect(!changed);
 }
 
+Status LlvmEnvironment::runGvnSink(ActionReply* reply) {
+  const auto before_path = fs::unique_path(workingDirectory_ / "module-%%%%%%%%.bc");
+  const auto after_path = fs::unique_path(workingDirectory_ / "module-%%%%%%%%.bc");
+  RETURN_IF_ERROR(writeBitcodeToFile(benchmark().module(), before_path));
+
+  const auto optPath = util::getRunfilesPath("compiler_gym/third_party/llvm/opt");
+  std::vector<std::string> optCmd{optPath.string(), before_path.string(), "-o", after_path.string(),
+                                  "-gvn-sink"};
+  // std::vector<std::string> optCmd{optPath.string(), "-", "-o", "-", "-gvn-sink"};
+
+  // TODO: Run opt -gvn-sink input.bc -o output.bc
+  auto opt =
+      subprocess::Popen(optCmd,
+                        // subprocess::input{subprocess::PIPE},
+                        subprocess::output{subprocess::PIPE}, subprocess::error{subprocess::PIPE});
+
+  std::string ir;
+  llvm::raw_string_ostream rso(ir);
+  benchmark().module().print(rso, /*AAW=*/nullptr);
+
+  // const auto optOutput = opt.communicate(ir.c_str(), ir.size());
+  const auto optOutput = opt.communicate();
+  if (opt.retcode()) {
+    fs::remove(before_path);
+    if (fs::exists(after_path)) {
+      fs::remove(after_path);
+    }
+    const std::string error(optOutput.second.buf.begin(), optOutput.second.buf.end());
+    return Status(StatusCode::INTERNAL, error);
+  }
+
+  if (!fs::exists(after_path)) {
+    fs::remove(before_path);
+    return Status(StatusCode::INTERNAL, "Failed to generate output file");
+  }
+
+  // TODO: Read the bitcode:
+  // Bitcode bitcode{optOutput.first.buf.begin(), optOutput.first.buf.end()};
+
+  Bitcode bitcode;
+  RETURN_IF_ERROR(readBitcodeFile(after_path, &bitcode));
+
+  // Update the module
+  Status status;
+  auto module = makeModule(benchmark().context(), bitcode, benchmark().name(), &status);
+  RETURN_IF_ERROR(status);
+  benchmark().replaceModule(std::move(module));
+
+  // We don't know.
+  reply->set_action_had_no_effect(true);
+
+  return Status::OK;
+}
+
 Status LlvmEnvironment::getObservation(LlvmObservationSpace space, Observation* reply) {
   switch (space) {
     case LlvmObservationSpace::IR: {
@@ -207,16 +286,9 @@ Status LlvmEnvironment::getObservation(LlvmObservationSpace space, Observation* 
     }
     case LlvmObservationSpace::BITCODE_FILE: {
       // Generate an output path with 16 bits of randomness.
-      const std::string outpath =
-          fs::unique_path(workingDirectory_ / "module-%%%%%%%%.bc").string();
-      std::error_code error;
-      llvm::raw_fd_ostream outfile(outpath, error);
-      if (error.value()) {
-        return Status(StatusCode::INTERNAL,
-                      fmt::format("Failed to write bitcode file: {}", outpath));
-      }
-      llvm::WriteBitcodeToFile(benchmark().module(), outfile);
-      reply->set_string_value(outpath);
+      const auto outpath = fs::unique_path(workingDirectory_ / "module-%%%%%%%%.bc");
+      RETURN_IF_ERROR(writeBitcodeToFile(benchmark().module(), outpath));
+      reply->set_string_value(outpath.string());
       break;
     }
     case LlvmObservationSpace::AUTOPHASE: {

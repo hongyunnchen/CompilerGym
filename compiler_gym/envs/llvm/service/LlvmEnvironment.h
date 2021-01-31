@@ -22,6 +22,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 #include "programl/proto/program_graph_options.pb.h"
 
 namespace compiler_gym::llvm_service {
@@ -57,9 +58,18 @@ class LlvmEnvironment {
   int actionCount() const { return actionCount_; }
 
  protected:
+  // Run the requested action.
+  [[nodiscard]] grpc::Status runAction(LlvmAction action, ActionReply* reply);
+
   // Run the given pass, possibly modifying the underlying LLVM module.
   void runPass(llvm::Pass* pass, ActionReply* reply);
   void runPass(llvm::FunctionPass* pass, ActionReply* reply);
+
+  // The -gvn-sink pass has nondeterministic behavior, likely due to pointer
+  // address sorting. To maintain a deterministic action space we have a special
+  // handler for this action which regresses to invoking the command line.
+  // See: https://github.com/facebookresearch/CompilerGym/issues/46
+  [[nodiscard]] grpc::Status runGvnSink(ActionReply* reply);
 
   inline Benchmark& benchmark() { return *benchmark_; }
 
